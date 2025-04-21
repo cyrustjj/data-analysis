@@ -1,0 +1,353 @@
+---
+title: "coursework2"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(zoo)
+library(tseries)
+library(knitr)
+library(xts)
+library(lubridate)
+library(broom)
+```
+
+## Connect to WRDS API
+```{r}
+library(RPostgres)
+wrds <- dbConnect(Postgres(),
+                  host='wrds-pgdata.wharton.upenn.edu',
+                  port=9737,
+                  dbname='wrds',
+                  sslmode='require',
+                  user='ct1424',
+                  password = 'Pampers*9812')
+```
+
+
+
+## Extract datasets
+```{r}
+query1 = "
+SELECT DISTINCT ON (DATE_TRUNC('month', date)) date,vix 
+FROM cboe_all.cboe 
+ORDER BY DATE_TRUNC('month', date), date DESC
+"
+query2 = "
+SELECT date,spindx,sprtrn FROM crsp.msi
+"
+vix = dbGetQuery(wrds, query1)
+sp500 = dbGetQuery(wrds, query2)
+
+# Close the connection
+dbDisconnect(wrds)
+
+# Read csv file for 25 Portfolios sorted on Size and B/M
+ports25 = read_csv("portfolios25_5x5.CSV",  skip = 15)
+
+# Read csv file for Fama-French Factors
+ff = read_csv("F-F_Research_Data_Factors.CSV",  skip = 3)
+```
+
+## Clean datasets
+```{r}
+# For vix
+vix = vix %>%
+  rename(vix_ind = 'vix') %>%
+  mutate(
+    vix_ind = ifelse(is.na(vix_ind), 0, vix_ind),
+    date = ceiling_date(date, "month") - days(1)
+    ) %>%
+  filter(date >= as.Date("1990-01-31"))
+
+vix = head(vix, -1)
+
+# For sp500
+sp500 = sp500 %>%
+  mutate(
+    date = ceiling_date(date, "month") - days(1) 
+         ) %>%
+  filter(date >= as.Date("1990-01-31"))
+
+# For ff
+names(ff)[1] <- "date"
+ff = ff %>%
+  mutate(
+    date = as.Date(paste0(date, "01"), format = "%Y%m%d"),
+    date = ceiling_date(date, "month") - days(1) 
+         ) %>%
+  filter(date >= as.Date("1990-01-31"))
+
+# For ports25
+names(ports25)[1] <- "date"
+ports25 = ports25 %>%
+  mutate(
+    date = as.Date(paste0(date, "01"), format = "%Y%m%d"),
+    date = ceiling_date(date, "month") - days(1) 
+         ) %>%
+  filter(date >= as.Date("1990-01-31")) %>%
+  slice(1:420)
+```
+
+## Create main dataset with reg components
+```{r}
+reg_data = ports25 %>%
+  pivot_longer(
+    cols = -date,
+    names_to = "port",
+    values_to = "port_re"
+  ) %>%
+  arrange(port) %>%
+  group_by(port) %>%
+  left_join(ff, by = "date") %>%
+  mutate(
+    port_re = port_re - RF
+  )
+```
+
+## Run Reg: (Step 1) TSR - i.e. across all time t, for each portfolio
+```{r}
+step1 = reg_data %>%
+  nest(data = c(date,port_re,`Mkt-RF`,SMB,HML,RF)) %>%
+  mutate(b_estimates = map(
+    data,
+    ~tidy(lm(port_re ~ `Mkt-RF` + SMB + HML, data = .x))
+  )) %>%
+  unnest(b_estimates) %>%
+  select(port, estimate, term) %>%
+  pivot_wider(names_from = term,
+              values_from = estimate) %>%
+  select(port,
+         b_mkt = "`Mkt-RF`",
+         b_smb = SMB,
+         b_hml = HML)
+
+print(step1)
+
+step1 = reg_data %>%
+  left_join(step1, by = "port")
+```
+
+## Run Reg: (Step 2) CSR - i.e. across the diff portfolios, at each time t
+```{r}
+step2 = step1 %>%
+  nest(data = c(port,port_re,b_mkt,b_smb,b_hml)) %>%
+  mutate(l_estimates = map(
+    data,
+    ~tidy(lm(port_re ~ b_mkt + b_smb + b_hml, data = .x))
+  )) %>%
+  unnest(l_estimates) %>%
+  select(date, estimate, term) %>%
+  pivot_wider(names_from = term,
+              values_from = estimate) %>%
+  select(date,
+         l_mkt = b_mkt,
+         l_smb = b_smb,
+         l_hml = b_hml)
+
+print(step2)
+```
+
+## Find factor risk premiums: (Step 3): Calc mean and var/standard error of lambdas
+```{r}
+l_mkt_mean = mean(step2$l_mkt)
+l_smb_mean = mean(step2$l_smb)
+l_hml_mean = mean(step2$l_hml)
+
+l_mkt_var = var(step2$l_mkt)
+l_smb_var = var(step2$l_smb)
+l_hml_var = var(step2$l_hml)
+
+```
+
+## Estimate cross-sectional averages
+```{r}
+t.test(step1$b_mkt, mu=0)
+t.test(step1$b_smb, mu=0)
+t.test(step1$b_hml, mu=0)
+
+t.test(step2$l_mkt, mu=0)
+t.test(step2$l_smb, mu=0)
+t.test(step2$l_hml, mu=0)
+```
+
+######
+## Augmenting reg with first log diff of VIX
+```{r}
+vix = vix %>%
+  #vix_ind = log(vix_ind) %>%
+  mutate(
+    vix_lg_diff = vix_ind - lag(vix_ind)
+  )
+
+areg_data = ports25 %>%
+  pivot_longer(
+    cols = -date,
+    names_to = "port",
+    values_to = "port_re"
+  ) %>%
+  arrange(port) %>%
+  group_by(port) %>%
+  left_join(ff, by = "date") %>%
+  left_join(vix, by = "date") %>%
+  ungroup() %>%
+  mutate(
+    port_re = port_re - RF
+  ) %>%
+  na.omit()
+```
+
+## Run Reg: (Step 1) TSR - i.e. across all time t, for each portfolio
+```{r}
+astep1 = areg_data %>%
+  nest(data = c(date,port_re,`Mkt-RF`,SMB,HML,RF, vix_ind, vix_lg_diff)) %>%
+  mutate(b_estimates = map(
+    data,
+    ~tidy(lm(port_re ~ `Mkt-RF` + SMB + HML + vix_lg_diff, data = .x))
+  )) %>%
+  unnest(b_estimates) %>%
+  select(port, estimate, term) %>%
+  pivot_wider(names_from = term,
+              values_from = estimate) %>%
+  select(port,
+         b_mkt = "`Mkt-RF`",
+         b_smb = SMB,
+         b_hml = HML,
+         b_vld = vix_lg_diff)
+
+print(astep1)
+
+astep1 = areg_data %>%
+  left_join(astep1, by = "port")
+```
+
+## Run Reg: (Step 2) CSR - i.e. across the diff portfolios, at each time t
+```{r}
+astep2 = astep1 %>%
+  nest(data = c(port,port_re,b_mkt,b_smb,b_hml, b_vld)) %>%
+  mutate(l_estimates = map(
+    data,
+    ~tidy(lm(port_re ~ b_mkt + b_smb + b_hml + b_vld, data = .x))
+  )) %>%
+  unnest(l_estimates) %>%
+  select(date, estimate, term) %>%
+  pivot_wider(names_from = term,
+              values_from = estimate) %>%
+  select(date,
+         l_mkt = b_mkt,
+         l_smb = b_smb,
+         l_hml = b_hml,
+         l_vld = b_vld)
+
+print(astep2)
+```
+
+## Find factor risk premiums: (Step 3): Calc mean and var/standard error of lambdas
+```{r}
+al_mkt_mean = mean(astep2$l_mkt)
+al_smb_mean = mean(astep2$l_smb)
+al_hml_mean = mean(astep2$l_hml)
+al_vld_mean = mean(astep2$l_vld)
+
+al_mkt_var = var(astep2$l_mkt)
+al_smb_var = var(astep2$l_smb)
+al_hml_var = var(astep2$l_hml)
+al_vld_var = var(astep2$l_vld)
+```
+
+## Estimate cross-sectional averages
+```{r}
+t.test(astep1$b_mkt, mu=0)
+t.test(astep1$b_smb, mu=0)
+t.test(step1$b_hml, mu=0)
+
+t.test(astep2$l_mkt, mu=0)
+t.test(astep2$l_smb, mu=0)
+t.test(astep2$l_hml, mu=0)
+t.test(astep2$l_vld, mu=0)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+###### Archive
+
+## Run Reg: (Step 1) TSR - i.e. across all time t, for each portfolio
+```{r}
+
+# Get estimated betas - for each portfolio
+b_est = data.frame(matrix(ncol = 4, nrow = 25)) %>%
+  rename(
+    intercept = 'X1',
+    b1 = 'X2',
+    b2 = 'X3',
+    b3 = 'X4'
+    )
+col_names = data.frame(colnames(ports25)[2:ncol(ports25)])
+
+for (i in 1:nrow(col_names)){
+  port = col_names[i,]
+  y = as.matrix(ports25[port])  # Dependent variable (portfolio i's excess returns)
+  x = as.matrix(reg_data[,(4:6)])  # independent variable (fama factors)
+  
+  mod = lm(y ~ x)
+  b = mod$coefficients
+  b[is.na(mod$coefficients)] = 0
+  
+  b_est[i,] = b
+}
+```
+
+```{r}
+
+# Get estimated lambdas - for each time t
+l_est = data.frame(matrix(ncol = 4, nrow = nrow(ports25)*25)) %>%
+  rename(
+    mkt = 'X1',
+    smb = 'X2',
+    hml = 'X3',
+    port = 'X4'
+    )
+
+col_names = data.frame(colnames(ports25)[2:ncol(ports25)])
+
+for (i in 2:(nrow(col_names)+1)){
+  
+  for (t in 1:nrow(ports25)){
+  
+    y = as.matrix(ports25[t,i])  # Portfolio i's excess return at a t)
+    x = as.matrix(b_est[i-1,(2:4)])  # est betas
+  
+    mod = lm(y ~ x - 1)
+    l = mod$coefficients
+    l[is.na(mod$coefficients)] = 0
+  
+    l_est[t,1] = l[1]
+    l_est[t,2] = l[2]
+    l_est[t,3] = l[3]
+    l_est[t,4] = col_names[i-1,1]
+  }
+}
+
+l_est$mkt = mean(ff$`Mkt-RF`)
+l_est$smb = mean(ff$`SMB`)
+l_est$hml = mean(ff$`HML`)
+
+```
+
+
+
+
+
+
+
+
